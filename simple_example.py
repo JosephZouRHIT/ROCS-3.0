@@ -5,6 +5,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from matplotlib.font_manager import FontProperties
+import time
 
 # Default recursion limit is 1000, which is not enough for recursion based SCC calculation
 sys.setrecursionlimit(10**6)
@@ -14,7 +15,7 @@ MAX_NUM_ITER = 2000
 FS = 16
 label_dtype = np.uint8
 obs_label = np.iinfo(label_dtype).max
-
+# np.random.seed(100)
 # Set up data from carAbst.cpp in ROCS
 state_space = [[0,10],
 			   [0,10]]
@@ -47,6 +48,7 @@ dba_lookup_table = [[1, 1, 1, 1, 2, 2, 3, 0],
 dba_init_state_idx = 0
 dba_acc_state_idx = 0
 
+start_time = time.time()
 # Keep original copy for plotting
 obstacle_original = obstacle.copy()
 goals_original = goals.copy()
@@ -214,9 +216,28 @@ while len(idx_queue) > 0:
 winning_set = np.argwhere(strategy_mat[:,0]==1).flatten()
 winning_set = np.array([decode_idx(x) for x in winning_set])
 winning_set = winning_set[winning_set[:,0]==dba_init_state_idx]
+print(f"solve time: {time.time()-start_time}")
+
+
 # Plotting trajectory using random initial state from winning set
 init_idx = winning_set[np.random.randint(0,winning_set.shape[0])].tolist()
 cur_idx = encode_idx(init_idx)
+traj_idx_list = [cur_idx]
+segment_split_idx = []
+visited_idx_set = set()
+visited_idx_set.add(cur_idx)
+
+def find_direction(p_idx, n_idx):
+	p_idx = decode_idx(p_idx)
+	n_idx = decode_idx(n_idx)
+	if n_idx[0] != p_idx[0]:
+		return dim+2
+	temp = np.array(p_idx[1:])-n_idx[1:]
+	dimension = np.argwhere(temp).squeeze()
+	direction = temp[temp!=0].squeeze()
+	if len(dimension.shape) > 0 or len(direction.shape) > 0:
+		print("More than one dimension changed")
+	return int(dimension+1)*int(direction)
 
 def idx_to_coord(idx_list):
 	return [(2*x+1)*y*0.5+z[0] for x,y,z in zip(idx_list,actual_grid_size,state_space)]
@@ -224,16 +245,105 @@ def idx_to_coord(idx_list):
 init_coord = idx_to_coord(init_idx[1:])
 traj_mat = np.zeros((MAX_NUM_ITER+1,dim))
 traj_mat[0] = init_coord
+
 num_acc_visit = 0
-for i in range(MAX_NUM_ITER):
+loop_start_idx = 0
+sim_end_idx = 0
+prev_dir = None
+for i in range(1, MAX_NUM_ITER):
+	next_idx = strategy_mat[cur_idx,1]
+	if next_idx in visited_idx_set:
+		loop_start_idx = traj_idx_list.index(next_idx)
+		sim_end_idx = i
+		break
+	next_dir = find_direction(cur_idx, next_idx)
+	if next_dir == dim+2:
+		segment_split_idx.append((i, False, prev_dir))
+		prev_dir = None
+	elif prev_dir != None and next_dir != prev_dir:
+		segment_split_idx.append((i, True, prev_dir))
+		prev_dir = None
+	elif prev_dir == None:
+		prev_dir = next_dir
 	next_idx = decode_idx(strategy_mat[cur_idx,1])
 	if next_idx[0] == dba_acc_state_idx:
 		num_acc_visit += 1
-	traj_mat[i+1] = idx_to_coord(next_idx[1:])
+
+	traj_mat[i] = idx_to_coord(next_idx[1:])
+
 	cur_idx = strategy_mat[cur_idx,1]
+	traj_idx_list.append(cur_idx)
+	visited_idx_set.add(cur_idx)
+traj_mat = traj_mat[:sim_end_idx,:]
+# print(traj_idx_list[loop_start_idx])
+# print(segment_split_idx)
+# print(loop_start_idx)
+# temp_traj_idx_list = np.array([decode_idx(x) for x in traj_idx_list])
+# print(temp_traj_idx_list)
+# print(decode_idx(4383))
+# print(traj_mat)
 
+cur_idx = 0
+output_boxes = []
+dir_list = list(range(dim))
+for next_idx, fold_flag, seg_dir in segment_split_idx:
+	# find min and max index in the segment
+	# decode them to get min and max index in each state space dimention along with current fold index
+	temp_idx = np.array(traj_idx_list[cur_idx:next_idx],dtype=np.int64)
+	cur_seg_max_idx = decode_idx(np.max(temp_idx))
+	cur_seg_min_idx = decode_idx(np.min(temp_idx))
+	# print(cur_seg_min_idx,cur_seg_max_idx)
+	cur_dba_idx = cur_seg_max_idx[0]
+	cur_seg_min_idx = cur_seg_min_idx[1:]
+	cur_seg_max_idx = cur_seg_max_idx[1:]
+	
+
+	# find safe label using dba_lookup_table
+	cur_safe_label = np.argwhere(dba_lookup_table[cur_dba_idx,:]==cur_dba_idx).flatten()
+	# find dimensions that need to expand
+	cur_dir_list = dir_list.copy()
+	expanding = np.array([True]*2*dim)
+	if seg_dir != None:
+		seg_dir = abs(seg_dir) - 1
+		cur_dir_list.remove(seg_dir)
+		expanding[seg_dir] = False
+		expanding[seg_dir+dim] = False
+
+	# While loop with inner for loop. While loop stops when an obstacle is detected or seen unsafe labels.
+	while np.any(expanding):
+
+		# Inner for loop go through cur_dir_list to expand and check all states.
+		for d in cur_dir_list:
+			# Positive direction
+			if expanding[d]:
+				cur_seg_max_idx[d] += 1
+				temp_slice = [slice(x,y+1) for x,y in zip(cur_seg_min_idx,cur_seg_max_idx)]
+				if cur_seg_max_idx[d] == label_mat.shape[d] or \
+				   not np.isin(label_mat[*temp_slice], cur_safe_label).all():
+					expanding[d] = False
+					cur_seg_max_idx[d] -= 1
+			# Negative direction
+			if expanding[d+dim]:
+				cur_seg_min_idx[d] -= 1
+				temp_slice = [slice(x,y+1) for x,y in zip(cur_seg_min_idx,cur_seg_max_idx)]
+				if cur_seg_min_idx[d] < 0 or \
+				   not np.isin(label_mat[*temp_slice], cur_safe_label).all():
+					expanding[d+dim] = False
+					cur_seg_min_idx[d] += 1
+	# print(cur_seg_min_idx,cur_seg_max_idx)
+	output_boxes.append([cur_seg_min_idx,cur_seg_max_idx])
+	if not fold_flag:
+		cur_idx = next_idx
+	else:
+		cur_idx = next_idx - 1
+print(output_boxes)
+actual_grid_size = np.array(actual_grid_size)
+output_boxes_coord = np.array([idx_to_coord(ub)+idx_to_coord(lb) for lb,ub in output_boxes])
+output_boxes_coord[:,:dim] += 0.5*actual_grid_size
+output_boxes_coord[:,dim:] -= 0.5*actual_grid_size
+output_boxes_coord = np.fliplr(output_boxes_coord)
+print(output_boxes_coord)
 traj_mat = np.fliplr(traj_mat)
-
 print(f"Number of acc visit: {num_acc_visit}")
 plt.figure()
 fig, ax = plt.subplots()
@@ -243,6 +353,10 @@ for lb,ub in goals_original:
 	ax.add_patch(Rectangle(lb,ub[0]-lb[0],ub[1]-lb[1],facecolor='gold'))
 for lb,ub in obstacle_original:
 	ax.add_patch(Rectangle(lb,ub[0]-lb[0],ub[1]-lb[1],facecolor='dimgray'))
+for box in output_boxes_coord:
+	lb = box[:dim]
+	ub = box[dim:]
+	ax.add_patch(Rectangle(lb,ub[0]-lb[0],ub[1]-lb[1],facecolor='blue'))
 plt.text(1.4, 1.2, '$a_1$', fontsize=FS)
 plt.text(1.3, 8.0, '$a_2$', fontsize=FS)
 plt.text(8.0, 5.5, '$a_3$', fontsize=FS)
@@ -256,4 +370,4 @@ plt.yticks(fontproperties=font)
 plt.plot(traj_mat[0,0], traj_mat[0,1], marker='^', markerfacecolor='r')
 plt.plot(traj_mat[-1,0], traj_mat[-1,1], marker='v', markerfacecolor='g')
 plt.grid()
-plt.savefig(f"./simple_example.png",dpi=1000)
+plt.savefig(f"./test_merged.png",dpi=1000)
